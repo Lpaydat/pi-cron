@@ -1,0 +1,22 @@
+{
+  "name": "pi-cron",
+  "version": "1.0.0",
+  "description": "Schedule pi prompts to run automatically on cron against any project directory. Webhook and file result delivery.",
+  "keywords": ["pi-package"],
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "config.ts",
+    "types.ts",
+    "runner.mjs",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
