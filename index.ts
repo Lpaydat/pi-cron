@@ -21,141 +21,6 @@ import {
 } from "./config";
 import type { CronJob } from "./types";
 
-// ── Natural language schedule parser ─────────────────────────────────
-
-/**
- * Converts natural language schedule descriptions to cron expressions.
- * Handles patterns like:
- *   "every day at 2am", "nightly at 3am", "every hour", "every 15 minutes",
- *   "weekdays at 9am", "monday at 10am", "daily at 3:30pm",
- *   "every monday at 9am", "twice a day at 9am and 5pm",
- *   "every weekday at 8:30am", "hourly", "daily", "weekly"
- */
-function parseNaturalSchedule(input: string): { cron: string; description: string } | null {
-  const s = input.toLowerCase().trim().replace(/\s+/g, " ");
-
-  // ── Direct cron pass-through (5 numeric fields) ────────────────
-  if (/^[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+$/.test(s)) {
-    return { cron: s, description: formatCronDescription(s) };
-  }
-
-  // ── Helper: parse time like "2am", "3:30pm", "14:00", "2:30 am" ─
-  const parseTime = (str: string): { hour: number; minute: number } | null => {
-    const m = str.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
-    if (!m) return null;
-    let hour = parseInt(m[1], 10);
-    const minute = m[2] ? parseInt(m[2], 10) : 0;
-    const ampm = m[3]?.toLowerCase();
-    if (ampm === "pm" && hour !== 12) hour += 12;
-    if (ampm === "am" && hour === 12) hour = 0;
-    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
-    return { hour, minute };
-  };
-
-  const dayNames: Record<string, number> = {
-    sunday: 0, sun: 0,
-    monday: 1, mon: 1,
-    tuesday: 2, tue: 2,
-    wednesday: 3, wed: 3,
-    thursday: 4, thu: 4,
-    friday: 5, fri: 5,
-    saturday: 6, sat: 6,
-  };
-
-  const dayAliases: Record<string, string> = {
-    weekday: "1-5", weekdays: "1-5",
-    "work day": "1-5", "work days": "1-5", workday: "1-5", workdays: "1-5",
-    "business day": "1-5", "business days": "1-5",
-    weekend: "0,6", weekends: "0,6",
-  };
-
-  // ── "every N minutes" ──────────────────────────────────────────
-  let m = s.match(/every\s+(\d+)\s+min(?:ute)?s?/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 59) return { cron: `*/${n} * * * *`, description: `every ${n} minutes` };
-  }
-
-  // ── "every N hours [at M]" ─────────────────────────────────────
-  m = s.match(/every\s+(\d+)\s+hours?(?:\s+at\s+(\d(?::\d{2})?(?:\s*[ap]m)?))?/);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    if (n >= 1 && n <= 23) {
-      if (m[2]) {
-        const t = parseTime(m[2]);
-        if (t) return { cron: `${t.minute} */${n} * * *`, description: `every ${n} hours at ${t.hour}:${String(t.minute).padStart(2, "0")}` };
-      }
-      return { cron: `0 */${n} * * *`, description: `every ${n} hours` };
-    }
-  }
-
-  // ── "every minute" ─────────────────────────────────────────────
-  if (/\bevery\s+minute\b/.test(s)) {
-    return { cron: "* * * * *", description: "every minute" };
-  }
-
-  // ── "hourly" / "every hour" ────────────────────────────────────
-  if (/\bhourly\b/.test(s) || /\bevery\s+hour\b/.test(s)) {
-    return { cron: "0 * * * *", description: "every hour" };
-  }
-
-  // ── Extract optional "at <time>" ──────────────────────────────
-  const timeMatch = s.match(/\bat\s+(\d{1,2}(?::\d{2})?(?:\s*[ap]m)?)/);
-  const time = timeMatch ? parseTime(timeMatch[1]) : null;
-
-  // ── Extract day-of-week patterns ───────────────────────────────
-  let dow: string | null = null;
-  for (const [alias, expr] of Object.entries(dayAliases)) {
-    if (s.includes(alias)) { dow = expr; break; }
-  }
-  if (!dow) {
-    for (const [name, num] of Object.entries(dayNames)) {
-      // Match "monday", "mondays", "on mon", "every mon"
-      const re = new RegExp(`\\b(?:every\\s+)?(?:on\\s+)?${name}s?\\b`);
-      if (re.test(s)) { dow = String(num); break; }
-    }
-  }
-
-  // ── "daily" / "every day" / "nightly" ──────────────────────────
-  if (/\b(daily|every\s+day|nightly|each\s+day)\b/.test(s)) {
-    if (time) return { cron: `${time.minute} ${time.hour} * * *`, description: `daily at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
-    if (/\bnightly\b/.test(s)) return { cron: "0 0 * * *", description: "nightly at midnight" };
-    return { cron: "0 0 * * *", description: "daily at midnight" };
-  }
-
-  // ── "weekly" / "every week" ────────────────────────────────────
-  if (/\b(weekly|every\s+week)\b/.test(s)) {
-    if (time) return { cron: `${time.minute} ${time.hour} * * 1`, description: `weekly on Monday at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
-    return { cron: "0 0 * * 1", description: "weekly on Monday at midnight" };
-  }
-
-  // ── "monthly" / "every month" ──────────────────────────────────
-  if (/\b(monthly|every\s+month)\b/.test(s)) {
-    if (time) return { cron: `${time.minute} ${time.hour} 1 * *`, description: `monthly on the 1st at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
-    return { cron: "0 0 1 * *", description: "monthly on the 1st at midnight" };
-  }
-
-  // ── Day-of-week without "daily" keyword ────────────────────────
-  if (dow && time) {
-    const dayLabel = Object.entries(dayNames).find(([, v]) => String(v) === dow)?.[0] ?? dow;
-    const aliasLabel = Object.entries(dayAliases).find(([, v]) => v === dow)?.[0] ?? null;
-    const label = aliasLabel || dayLabel;
-    return { cron: `${time.minute} ${time.hour} * * ${dow}`, description: `every ${label} at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
-  }
-  if (dow) {
-    const dayLabel = Object.entries(dayNames).find(([, v]) => String(v) === dow)?.[0] ?? dow;
-    const aliasLabel = Object.entries(dayAliases).find(([, v]) => v === dow)?.[0] ?? null;
-    const label = aliasLabel || dayLabel;
-    return { cron: `0 0 * * ${dow}`, description: `every ${label} at midnight` };
-  }
-
-  // ── Just a time: "at 2am", "3:30pm" ────────────────────────────
-  if (time && !dow) {
-    return { cron: `${time.minute} ${time.hour} * * *`, description: `daily at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
-  }
-
-  return null;
-}
 
 // ── Auto-generate job name from prompt ───────────────────────────────
 
@@ -164,44 +29,6 @@ function deriveNameFromPrompt(prompt: string): string {
   const first = prompt.replace(/\n/g, " ").split(/[.!?\n]/)[0].trim();
   if (first.length <= 60) return first;
   return first.substring(0, 57) + "...";
-}
-
-// ── Extract prompt + schedule from a single natural text ─────────────
-//
-// Given: "review code every day at 2am"
-//   → { prompt: "review code", when: "every day at 2am" }
-//
-// Given: "send a daily standup report at 9am"
-//   → { prompt: "send a daily standup report", when: "at 9am" }
-//
-// Given: "run the test suite"  (no schedule found)
-//   → { prompt: "run the test suite" }
-//
-function extractPromptAndSchedule(text: string): { prompt: string; when?: string } {
-  const schedulePatterns = [
-    // "every N minutes/hours [at time]"
-    /\s+every\s+\d+\s+(?:min(?:ute)?s?|hours?)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
-    // "every day/week/month/hour/minute/weekday/Monday etc [at time]"
-    /\s+every\s+(?:day|week|month|hour|minute|night|weekday|weekend|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\w*(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
-    // "daily/nightly/hourly/weekly/monthly [at time]"
-    /\s+(?:daily|nightly|hourly|weekly|monthly)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
-    // "on weekdays/weekends/Monday [at time]"
-    /\s+on\s+(?:weekdays?|weekends?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|saturdays?|sundays?)\w*(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
-    // "at 2am/3:30pm" (time-only → daily)
-    /\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*$/i,
-  ];
-
-  for (const pattern of schedulePatterns) {
-    const match = text.match(pattern);
-    if (match) {
-      const when = match[0].trim();
-      const prompt = text.substring(0, text.length - match[0].length).trim();
-      // Only use if there's actual prompt content left
-      if (prompt) return { prompt, when };
-    }
-  }
-
-  return { prompt: text };
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -392,8 +219,8 @@ async function cmdList(ctx: any) {
   ctx.ui.notify([header, sep, ...rows, "", `Config: ${getConfigPath()}`].join("\n"), "info");
 }
 
-async function cmdAdd(rest: string[], ctx: any) {
-  // Accept full natural text as args, or prompt once if empty
+async function cmdAdd(rest: string[], ctx: any, pi: any) {
+  // Accept full natural text — hand it to the LLM to figure out
   let text = rest.join(" ").trim();
 
   // Strip surrounding quotes
@@ -403,8 +230,8 @@ async function cmdAdd(rest: string[], ctx: any) {
 
   if (!text) {
     text = await ctx.ui.input(
-      "What should pi do? (include schedule, e.g. 'review code daily at 2am')",
-      "review code daily at 2am"
+      "What should pi do and when?",
+      "review code every day at 2am"
     );
     if (!text) {
       ctx.ui.notify("Cancelled.", "info");
@@ -412,56 +239,9 @@ async function cmdAdd(rest: string[], ctx: any) {
     }
   }
 
-  // Try to extract schedule from the natural text
-  const extracted = extractPromptAndSchedule(text);
-  let prompt = extracted.prompt;
-  let schedule: string | null = null;
-  let scheduleDesc = "";
-
-  if (extracted.when) {
-    const parsed = parseNaturalSchedule(extracted.when);
-    if (parsed) {
-      schedule = parsed.cron;
-      scheduleDesc = parsed.description;
-    }
-  }
-
-  // If no schedule found, try the whole text as cron
-  if (!schedule) {
-    const v = validateCron(text);
-    if (v.valid) {
-      schedule = text;
-      scheduleDesc = formatCronDescription(text);
-      prompt = "(run scheduled task)";
-    }
-  }
-
-  // If still no schedule, default to daily at midnight
-  if (!schedule) {
-    schedule = "0 0 * * *";
-    scheduleDesc = "daily at midnight (default — no schedule specified)";
-    prompt = text; // use full text as prompt since we couldn't split it
-  }
-
-  const name = deriveNameFromPrompt(prompt);
-
-  const job: CronJob = {
-    id: generateId(),
-    name,
-    schedule,
-    cwd: ctx.cwd,
-    prompt,
-    enabled: true,
-    lastRun: null,
-    lastResult: null,
-    lastStatus: null,
-    createdAt: new Date().toISOString(),
-  };
-
-  addJob(job);
-  ctx.ui.notify(
-    `✅ Created "${job.name}"\n  Schedule: ${scheduleDesc} (${schedule})\n  CWD: ${job.cwd}\n  Prompt: ${prompt.substring(0, 200)}${prompt.length > 200 ? "..." : ""}\n\nRun /cron install to register with crontab, or /cron run ${job.id} to test.`,
-    "success"
+  // Forward to the LLM — it understands natural language, regex doesn't
+  pi.sendUserMessage(
+    `Create a cron job for this project (${ctx.cwd}): ${text}`
   );
 }
 
@@ -791,7 +571,7 @@ export default function (pi: ExtensionAPI) {
         case "status":
           return cmdShow(rest, ctx);
         case "add":
-          return cmdAdd(rest, ctx);
+          return cmdAdd(rest, ctx, pi);
         case "remove":
         case "rm":
         case "delete":
