@@ -31,6 +31,24 @@ function deriveNameFromPrompt(prompt: string): string {
   return first.substring(0, 57) + "...";
 }
 
+// ── Parse relative time delay ("+10s", "+5m", "+1h", "+2d") ─────────
+
+function parseDelay(input: string): number | null {
+  const s = input.trim().replace(/^\+/, "");
+  const m = s.match(/^(\d+)(s|m|h|d)$/i);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  const unit = m[2].toLowerCase();
+  if (unit === "s") return n * 1000;
+  if (unit === "m") return n * 60 * 1000;
+  if (unit === "h") return n * 60 * 60 * 1000;
+  if (unit === "d") return n * 24 * 60 * 60 * 1000;
+  return null;
+}
+
+// Track active one-shot timers so we can clean up
+const activeTimers = new Map<string, NodeJS.Timeout>();
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function ensureLogsDir(jobId: string): string {
@@ -602,17 +620,19 @@ export default function (pi: ExtensionAPI) {
     name: "cron_manage",
     label: "Cron Manager",
     description:
-      "Schedule and manage automated pi tasks. The agent must auto-derive the job name and cron schedule from the user's natural language request. Only requires the prompt (what to run) and when to run it.",
+      "Schedule and manage automated pi tasks. Supports two types:\n- cron: recurring schedule (e.g. daily at 2am, every 15min)\n- once: one-shot delayed execution (e.g. in 10 seconds, in 5 minutes)\n\nThe agent must auto-derive the job name, type, and schedule from the user's natural language request.",
     promptSnippet: "Schedule automated cron jobs for pi",
     promptGuidelines: [
-      "YOU are the schedule parser. Convert the user's natural language directly to a 5-field cron expression. NEVER pass natural language to the 'schedule' field — convert it yourself.",
+      "YOU are the schedule parser. Convert the user's natural language directly to cron expressions or delay values.",
+      "If the user says 'in X seconds/minutes/hours' or 'once' → use type='once' with delay like '+10s', '+5m', '+1h'",
+      "If the user says 'every X', 'daily', 'hourly', 'weekly', etc. → use type='cron' with a 5-field cron expression",
       "Cron reference — 5 fields: minute hour day-of-month month day-of-week",
-      "  Examples: '0 2 * * *' = daily 2am, '*/15 * * * *' = every 15min, '0 9 * * 1-5' = weekdays 9am, '0 0 * * 0' = weekly sunday midnight, '30 8 1 * *' = monthly 1st 8:30am",
+      "  Examples: '0 2 * * *' = daily 2am, '*/15 * * * *' = every 15min, '0 9 * * 1-5' = weekdays 9am",
       "  Time: 0=midnight, 2=2am, 14=2pm, 23=11pm. Days: 0=Sun, 1=Mon, ..., 6=Sat",
-      "NEVER ask the user for a cron expression or job name. Derive them from what the user says.",
+      "NEVER ask the user for a cron expression, job name, or job type. Derive everything from what the user says.",
       "The 'name' parameter is optional — if omitted, it's auto-generated from the prompt",
-      "Each job targets a project directory and uses that project's pi settings (extensions, skills, AGENTS.md)",
-      "After creating a job, tell the user to run /cron install to register with crontab, or /cron run <id> to test",
+      "Each job targets a project directory and uses that project's pi settings",
+      "For type='once' jobs, the runner spawns pi immediately after the delay — no crontab install needed",
     ],
     parameters: Type.Object({
       action: StringEnum([
@@ -624,6 +644,9 @@ export default function (pi: ExtensionAPI) {
         "disable",
         "run",
       ] as const),
+      type: Type.Optional(
+        StringEnum(["cron", "once"] as const, { description: "Job type: 'cron' for recurring schedules, 'once' for one-shot delayed execution. Default: 'cron'. Use 'once' when the user says 'in X seconds/minutes/hours'." })
+      ),
       jobId: Type.Optional(
         Type.String({ description: "Job ID (for remove/enable/disable/run)" })
       ),
@@ -785,46 +808,51 @@ export default function (pi: ExtensionAPI) {
         case "add": {
           if (!params.prompt) {
             return {
-              content: [
-                {
-                  type: "text",
-                  text: "The 'prompt' field is required — what should pi do?",
-                },
-              ],
+              content: [{ type: "text", text: "The 'prompt' field is required — what should pi do?" }],
               details: {},
             };
           }
 
-          if (!params.schedule) {
-            return {
-              content: [
-                {
-                  type: "text",
-                  text: "The 'schedule' field is required — provide a 5-field cron expression. You MUST convert the user's natural language to cron yourself. Examples: daily 2am='0 2 * * *', every 15min='*/15 * * * *', weekdays 9am='0 9 * * 1-5', weekly monday='0 0 * * 1'.",
-                },
-              ],
-              details: {},
-            };
-          }
-
-          const validation = validateCron(params.schedule);
-          if (!validation.valid) {
-            return {
-              content: [{ type: "text", text: `Invalid cron expression '${params.schedule}': ${validation.error}. Must be 5 fields: minute hour day-of-month month day-of-week. Examples: '0 2 * * *' (daily 2am), '*/15 * * * *' (every 15min), '0 9 * * 1-5' (weekdays 9am).` }],
-              details: {},
-            };
-          }
-
-          const schedule = params.schedule;
-          const scheduleDesc = formatCronDescription(schedule);
-
-          // ── Auto-derive name from prompt if not given ────────────
+          const jobType = params.type === "once" ? "once" : "cron";
           const name = params.name || deriveNameFromPrompt(params.prompt);
+          let schedule = params.schedule || "";
+          let scheduleDesc = "";
+          let delayMs: number | undefined;
+
+          if (jobType === "once") {
+            // One-shot: schedule is a delay like "+10s", "+5m", "+1h"
+            delayMs = parseDelay(schedule);
+            if (!delayMs) {
+              return {
+                content: [{ type: "text", text: `For type='once', schedule must be a delay like '+10s', '+5m', '+1h', '+2d'. Got: '${schedule}'` }],
+                details: {},
+              };
+            }
+            scheduleDesc = `in ${schedule.replace(/^\+/, "")}`;
+          } else {
+            // Recurring cron
+            if (!schedule) {
+              return {
+                content: [{ type: "text", text: "The 'schedule' field is required for cron jobs — provide a 5-field cron expression. Examples: '0 2 * * *' (daily 2am), '*/15 * * * *' (every 15min), '0 9 * * 1-5' (weekdays 9am)." }],
+                details: {},
+              };
+            }
+            const validation = validateCron(schedule);
+            if (!validation.valid) {
+              return {
+                content: [{ type: "text", text: `Invalid cron expression '${schedule}': ${validation.error}` }],
+                details: {},
+              };
+            }
+            scheduleDesc = formatCronDescription(schedule);
+          }
 
           const job: CronJob = {
             id: generateId(),
             name,
+            type: jobType,
             schedule,
+            delayMs: delayMs || undefined,
             cwd: params.cwd || ctx.cwd,
             prompt: params.prompt,
             model: params.model || undefined,
@@ -841,13 +869,30 @@ export default function (pi: ExtensionAPI) {
           };
 
           addJob(job);
+
+          // For one-shot jobs, start the timer now
+          if (jobType === "once" && delayMs) {
+            ctx.ui.notify(`⏱️ One-shot job "${name}" will run ${scheduleDesc}...`, "info");
+            const timer = setTimeout(() => {
+              activeTimers.delete(job.id);
+              if (!existsSync(job.cwd)) return;
+              runJobInBackground(job, ctx);
+              // Auto-disable after firing
+              updateJob(job.id, { enabled: false });
+              ctx.ui.notify(`✅ One-shot job "${name}" fired and executed`, "success");
+            }, delayMs);
+            activeTimers.set(job.id, timer);
+          }
+
+          const extra = jobType === "once"
+            ? `Will run ${scheduleDesc} automatically. No /cron install needed.`
+            : `Run /cron install to register with crontab, or /cron run ${job.id} to test.`;
+
           return {
-            content: [
-              {
-                type: "text",
-                text: `✅ Created scheduled job "${job.name}" (ID: ${job.id})\n  Schedule: ${job.schedule} (${scheduleDesc})\n  CWD: ${job.cwd}\n  Model: ${job.model || "default"}\n  Webhook: ${job.onComplete?.webhook || "none"}\n  File: ${job.onComplete?.writeFile || "none"}\n\nTell the user to run /cron install to register with crontab, or /cron run ${job.id} to test.`,
-              },
-            ],
+            content: [{
+              type: "text",
+              text: `✅ Created ${jobType} job "${name}" (ID: ${job.id})\n  Schedule: ${scheduleDesc}\n  CWD: ${job.cwd}\n  Model: ${job.model || "default"}\n\n${extra}`,
+            }],
             details: { job },
           };
         }
