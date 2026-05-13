@@ -403,8 +403,8 @@ async function cmdAdd(rest: string[], ctx: any) {
 
   if (!text) {
     text = await ctx.ui.input(
-      "What should pi do and when?",
-      "review code every day at 2am"
+      "What should pi do? (include schedule, e.g. 'review code daily at 2am')",
+      "review code daily at 2am"
     );
     if (!text) {
       ctx.ui.notify("Cancelled.", "info");
@@ -426,35 +426,21 @@ async function cmdAdd(rest: string[], ctx: any) {
     }
   }
 
-  // If we still don't have a schedule, ask ONE follow-up
+  // If no schedule found, try the whole text as cron
   if (!schedule) {
-    const whenInput = await ctx.ui.input(
-      "When should this run?",
-      "every day at midnight"
-    );
-    if (!whenInput) {
-      ctx.ui.notify("Cancelled.", "info");
-      return;
+    const v = validateCron(text);
+    if (v.valid) {
+      schedule = text;
+      scheduleDesc = formatCronDescription(text);
+      prompt = "(run scheduled task)";
     }
+  }
 
-    const parsed = parseNaturalSchedule(whenInput);
-    if (parsed) {
-      schedule = parsed.cron;
-      scheduleDesc = parsed.description;
-    } else {
-      // Last resort: try as raw cron expression
-      const v = validateCron(whenInput);
-      if (v.valid) {
-        schedule = whenInput;
-        scheduleDesc = formatCronDescription(whenInput);
-      } else {
-        ctx.ui.notify(
-          `Could not understand that schedule. Try something like:\n  "every day at 2am"\n  "weekdays at 9am"\n  "every 15 minutes"\n  "hourly"\n  "0 2 * * *" (cron expression)`,
-          "error"
-        );
-        return;
-      }
-    }
+  // If still no schedule, default to daily at midnight
+  if (!schedule) {
+    schedule = "0 0 * * *";
+    scheduleDesc = "daily at midnight (default — no schedule specified)";
+    prompt = text; // use full text as prompt since we couldn't split it
   }
 
   const name = deriveNameFromPrompt(prompt);
