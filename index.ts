@@ -49,6 +49,25 @@ function resolvePlaceholders(str: string): string {
     .replace(/\{timestamp\}/g, now.toISOString().replace(/[:.]/g, "-"));
 }
 
+function resolvePiBin(): string {
+  // Try config first, then common locations, then bare 'pi'
+  try {
+    const cfg = loadConfig();
+    if (cfg.piPath && existsSync(cfg.piPath)) return cfg.piPath;
+  } catch {}
+  const candidates = [
+    process.env.PI_BIN,
+    "/home/lpaydat/.local/share/pnpm/pi",
+    "/home/lpaydat/.local/bin/pi",
+    "/usr/local/bin/pi",
+    "/usr/bin/pi",
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    if (existsSync(c)) return c;
+  }
+  return "pi";
+}
+
 function runJobInBackground(job: CronJob, ctx: any) {
   const args = ["-p"];
   if (job.model) {
@@ -60,7 +79,7 @@ function runJobInBackground(job: CronJob, ctx: any) {
 
   ctx.ui.setStatus("cron", `⏳ Running: ${job.name}...`);
 
-  const proc = spawn("pi", args, {
+  const proc = spawn(resolvePiBin(), args, {
     cwd: job.cwd,
   });
 
