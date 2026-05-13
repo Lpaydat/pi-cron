@@ -836,13 +836,15 @@ export default function (pi: ExtensionAPI) {
     name: "cron_manage",
     label: "Cron Manager",
     description:
-      "Schedule and manage automated pi tasks. Accepts natural language for scheduling — the agent should derive the job name and schedule from the user's request automatically. Only requires the prompt (what to run) and when to run it.",
+      "Schedule and manage automated pi tasks. The agent must auto-derive the job name and cron schedule from the user's natural language request. Only requires the prompt (what to run) and when to run it.",
     promptSnippet: "Schedule automated cron jobs for pi",
     promptGuidelines: [
-      "ALWAYS auto-derive the job name and schedule from the user's request — never ask the user for a cron expression or job name",
-      "The 'when' parameter accepts natural language: 'every day at 2am', 'weekdays at 9am', 'hourly', 'every 15 minutes', 'nightly', 'mondays at 10am', etc.",
+      "YOU are the schedule parser. Convert the user's natural language directly to a 5-field cron expression. NEVER pass natural language to the 'schedule' field — convert it yourself.",
+      "Cron reference — 5 fields: minute hour day-of-month month day-of-week",
+      "  Examples: '0 2 * * *' = daily 2am, '*/15 * * * *' = every 15min, '0 9 * * 1-5' = weekdays 9am, '0 0 * * 0' = weekly sunday midnight, '30 8 1 * *' = monthly 1st 8:30am",
+      "  Time: 0=midnight, 2=2am, 14=2pm, 23=11pm. Days: 0=Sun, 1=Mon, ..., 6=Sat",
+      "NEVER ask the user for a cron expression or job name. Derive them from what the user says.",
       "The 'name' parameter is optional — if omitted, it's auto-generated from the prompt",
-      "The 'schedule' parameter is also optional — use 'when' for natural language instead",
       "Each job targets a project directory and uses that project's pi settings (extensions, skills, AGENTS.md)",
       "After creating a job, tell the user to run /cron install to register with crontab, or /cron run <id> to test",
     ],
@@ -864,12 +866,7 @@ export default function (pi: ExtensionAPI) {
       ),
       schedule: Type.Optional(
         Type.String({
-          description: "Cron expression (e.g. '0 2 * * *'). Prefer 'when' for natural language.",
-        })
-      ),
-      when: Type.Optional(
-        Type.String({
-          description: "Natural language schedule: 'every day at 2am', 'weekdays at 9am', 'hourly', 'every 15 minutes', 'nightly', 'mondays at 10am', 'daily at 3:30pm', etc.",
+          description: "5-field cron expression. YOU must convert the user's natural language to this. e.g. '0 2 * * *' for daily 2am, '*/15 * * * *' for every 15min, '0 9 * * 1-5' for weekdays 9am",
         })
       ),
       prompt: Type.Optional(
@@ -1032,56 +1029,28 @@ export default function (pi: ExtensionAPI) {
             };
           }
 
-          // ── Resolve schedule: when (natural) → schedule (cron) ────
-          let schedule: string | null = null;
-          let scheduleDesc: string = "";
-
-          if (params.when) {
-            const parsed = parseNaturalSchedule(params.when);
-            if (parsed) {
-              schedule = parsed.cron;
-              scheduleDesc = parsed.description;
-            } else {
-              // Try as raw cron expression
-              const v = validateCron(params.when);
-              if (v.valid) {
-                schedule = params.when;
-                scheduleDesc = formatCronDescription(params.when);
-              } else {
-                return {
-                  content: [
-                    {
-                      type: "text",
-                      text: `Could not parse "${params.when}" as a schedule. Try something like "every day at 2am", "weekdays at 9am", "hourly", or a cron expression like "0 2 * * *".`,
-                    },
-                  ],
-                  details: {},
-                };
-              }
-            }
-          } else if (params.schedule) {
-            const v = validateCron(params.schedule);
-            if (!v.valid) {
-              return {
-                content: [{ type: "text", text: `Invalid cron expression: ${v.error}` }],
-                details: {},
-              };
-            }
-            schedule = params.schedule;
-            scheduleDesc = formatCronDescription(params.schedule);
-          }
-
-          if (!schedule) {
+          if (!params.schedule) {
             return {
               content: [
                 {
                   type: "text",
-                  text: "No schedule provided. Use 'when' (e.g. 'daily at 2am') or 'schedule' (cron expression).",
+                  text: "The 'schedule' field is required — provide a 5-field cron expression. You MUST convert the user's natural language to cron yourself. Examples: daily 2am='0 2 * * *', every 15min='*/15 * * * *', weekdays 9am='0 9 * * 1-5', weekly monday='0 0 * * 1'.",
                 },
               ],
               details: {},
             };
           }
+
+          const validation = validateCron(params.schedule);
+          if (!validation.valid) {
+            return {
+              content: [{ type: "text", text: `Invalid cron expression '${params.schedule}': ${validation.error}. Must be 5 fields: minute hour day-of-month month day-of-week. Examples: '0 2 * * *' (daily 2am), '*/15 * * * *' (every 15min), '0 9 * * 1-5' (weekdays 9am).` }],
+              details: {},
+            };
+          }
+
+          const schedule = params.schedule;
+          const scheduleDesc = formatCronDescription(schedule);
 
           // ── Auto-derive name from prompt if not given ────────────
           const name = params.name || deriveNameFromPrompt(params.prompt);
