@@ -31,21 +31,6 @@ function deriveNameFromPrompt(prompt: string): string {
   return first.substring(0, 57) + "...";
 }
 
-// ── Parse relative time delay ("+10s", "+5m", "+1h", "+2d") ─────────
-
-function parseDelay(input: string): number | null {
-  const s = input.trim().replace(/^\+/, "");
-  const m = s.match(/^(\d+)(s|m|h|d)$/i);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  const unit = m[2].toLowerCase();
-  if (unit === "s") return n * 1000;
-  if (unit === "m") return n * 60 * 1000;
-  if (unit === "h") return n * 60 * 60 * 1000;
-  if (unit === "d") return n * 24 * 60 * 60 * 1000;
-  return null;
-}
-
 // Track active one-shot timers so we can clean up
 const activeTimers = new Map<string, NodeJS.Timeout>();
 
@@ -655,8 +640,11 @@ export default function (pi: ExtensionAPI) {
       ),
       schedule: Type.Optional(
         Type.String({
-          description: "5-field cron expression. YOU must convert the user's natural language to this. e.g. '0 2 * * *' for daily 2am, '*/15 * * * *' for every 15min, '0 9 * * 1-5' for weekdays 9am",
+          description: "5-field cron expression for type=cron. YOU convert natural language. e.g. '0 2 * * *' = daily 2am, '*/15 * * * *' = every 15min",
         })
+      ),
+      delayMs: Type.Optional(
+        Type.Number({ description: "Delay in milliseconds for type=once. YOU calculate from natural language. 'in 10s' → 10000, 'in 5min' → 300000, 'in 1 hour' → 3600000" })
       ),
       prompt: Type.Optional(
         Type.String({ description: "The pi prompt to execute (for add). Required for add action." })
@@ -820,15 +808,18 @@ export default function (pi: ExtensionAPI) {
           let delayMs: number | undefined;
 
           if (jobType === "once") {
-            // One-shot: schedule is a delay like "+10s", "+5m", "+1h"
-            delayMs = parseDelay(schedule);
-            if (!delayMs) {
+            // One-shot: LLM provides delayMs directly
+            delayMs = params.delayMs;
+            if (!delayMs || delayMs <= 0) {
               return {
-                content: [{ type: "text", text: `For type='once', schedule must be a delay like '+10s', '+5m', '+1h', '+2d'. Got: '${schedule}'` }],
+                content: [{ type: "text", text: "For type='once', you must provide delayMs in milliseconds. e.g. 'in 10s' → delayMs=10000, 'in 5min' → delayMs=300000" }],
                 details: {},
               };
             }
-            scheduleDesc = `in ${schedule.replace(/^\+/, "")}`;
+            schedule = `once:${delayMs}ms`;
+            if (delayMs < 60000) scheduleDesc = `in ${Math.round(delayMs / 1000)}s`;
+            else if (delayMs < 3600000) scheduleDesc = `in ${Math.round(delayMs / 60000)}min`;
+            else scheduleDesc = `in ${Math.round(delayMs / 3600000)}h`;
           } else {
             // Recurring cron
             if (!schedule) {
