@@ -68,7 +68,7 @@ function resolvePiBin(): string {
   return "pi";
 }
 
-function runJobInBackground(job: CronJob, ctx?: any) {
+function runJobInBackground(job: CronJob) {
   const args = ["-p"];
   if (job.model) {
     let modelStr = job.model;
@@ -76,15 +76,6 @@ function runJobInBackground(job: CronJob, ctx?: any) {
     args.push("--model", modelStr);
   }
   args.push(job.prompt);
-
-  const notify = (msg: string, level: string) => {
-    try { ctx?.ui?.notify(msg, level as any); } catch {}
-  };
-  const setStatus = (key: string, val: string | undefined) => {
-    try { ctx?.ui?.setStatus(key, val as any); } catch {}
-  };
-
-  setStatus("cron", `⏳ Running: ${job.name}...`);
 
   console.log(`[pi-cron] Spawning: ${resolvePiBin()} ${args.join(" ")} in ${job.cwd}`);
 
@@ -117,20 +108,13 @@ function runJobInBackground(job: CronJob, ctx?: any) {
       lastStatus: success ? "success" : "error",
     });
 
-    // Deliver results
+    // Deliver results (writeFile, webhook)
     deliverResults(job, output, success);
 
-    setStatus("cron", undefined);
-    notify(
-      `Cron "${job.name}" ${success ? "✅ completed" : "❌ failed"}. Log: ${logFile}`,
-      success ? "success" : "error"
-    );
     console.log(`[pi-cron] Job "${job.name}" ${success ? "completed" : "failed"}. Log: ${logFile}`);
   });
 
   proc.on("error", (err: Error) => {
-    setStatus("cron", undefined);
-    notify(`Cron "${job.name}" failed to start: ${err.message}`, "error");
     console.error(`[pi-cron] Spawn error for "${job.name}": ${err.message}`);
   });
 }
@@ -336,7 +320,7 @@ async function cmdRun(rest: string[], ctx: any) {
   }
 
   ctx.ui.notify(`Starting job "${job.name}" in background...\n  CWD: ${job.cwd}\n  Model: ${job.model || "default"}`, "info");
-  runJobInBackground(job, ctx);
+  runJobInBackground(job);
 }
 
 async function cmdInstall(ctx: any) {
@@ -996,7 +980,7 @@ export default function (pi: ExtensionAPI) {
             };
           }
 
-          runJobInBackground(job, ctx);
+          runJobInBackground(job);
           return {
             content: [
               {
