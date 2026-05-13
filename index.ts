@@ -483,16 +483,126 @@ async function cmdLogs(rest: string[], ctx: any) {
   }
 }
 
+async function cmdShow(rest: string[], ctx: any) {
+  const scope = rest[0]; // "all" | undefined (project scope)
+  const crontab = readCrontab();
+
+  if (!crontab.trim()) {
+    ctx.ui.notify("No crontab entries found.", "info");
+    return;
+  }
+
+  // Parse pi-cron entries from crontab
+  const entries: { jobId: string; jobName: string; schedule: string; line: string }[] = [];
+  const lines = crontab.split("\n");
+  let currentMarker = "";
+
+  for (const line of lines) {
+    if (line.includes(CRON_MARKER_START)) {
+      // Extract job name from marker: "# PI-CRON:job-xxx — Job Name"
+      currentMarker = line;
+      continue;
+    }
+    if (line.includes(CRON_MARKER_END)) {
+      currentMarker = "";
+      continue;
+    }
+    if (currentMarker) {
+      const markerMatch = currentMarker.match(/PI-CRON:(\S+)\s*—\s*(.+)/);
+      const jobId = markerMatch?.[1] || "?";
+      const jobName = markerMatch?.[2]?.trim() || "?";
+      // The actual cron line (skip comment-like lines)
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith("#")) {
+        entries.push({ jobId, jobName, schedule: trimmed.split(/\s+/).slice(0, 5).join(" "), line: trimmed });
+      }
+    }
+  }
+
+  // Load config to resolve cwd per job
+  const config = loadConfig();
+  const jobMap = new Map(config.jobs.map((j) => [j.id, j]));
+  const cwd = ctx.cwd;
+
+  if (entries.length === 0) {
+    ctx.ui.notify("No pi-cron entries in crontab. Run /cron install to register jobs.", "info");
+    return;
+  }
+
+  const isProjectScope = !scope || scope === "project" || scope === ".";
+
+  if (isProjectScope && scope !== "all") {
+    // Show only jobs matching current project directory
+    const projectEntries = entries.filter((e) => {
+      const job = jobMap.get(e.jobId);
+      return job && job.cwd === cwd;
+    });
+
+    if (projectEntries.length === 0) {
+      ctx.ui.notify(
+        `No pi-cron entries for this project (${cwd}).\nUse \`/cron show all\` to see all entries.`,
+        "info"
+      );
+      return;
+    }
+
+    const rows = projectEntries.map((e) => {
+      const job = jobMap.get(e.jobId);
+      const status = job?.enabled ? "✓" : "✗";
+      const last = job?.lastStatus || "never";
+      return `  ${status}  ${e.schedule.padEnd(15)} ${e.jobName.padEnd(30)} last: ${last}`;
+    });
+
+    ctx.ui.notify(
+      `📋 Pi-cron entries for this project:\n  ${cwd}\n\n` +
+      `  Status  Schedule        Name                            Last Run\n` +
+      `  ${"─".repeat(80)}\n` +
+      rows.join("\n") +
+      `\n\n${projectEntries.length} job(s) — use \`/cron show all\` for all entries`,
+      "info"
+    );
+  } else {
+    // Show all pi-cron entries, grouped by project
+    const byProject = new Map<string, typeof entries>();
+    for (const e of entries) {
+      const job = jobMap.get(e.jobId);
+      const projectCwd = job?.cwd || "unknown";
+      if (!byProject.has(projectCwd)) byProject.set(projectCwd, []);
+      byProject.get(projectCwd)!.push(e);
+    }
+
+    const sections: string[] = ["📋 All pi-cron crontab entries:\n"];
+    let projectIndex = 0;
+    for (const [projectCwd, projectEntries] of byProject) {
+      projectIndex++;
+      const isCurrentProject = projectCwd === cwd;
+      sections.push(`  ${isCurrentProject ? "▸" : " "} Project: ${projectCwd}${isCurrentProject ? "  (current)" : ""}`);
+
+      for (const e of projectEntries) {
+        const job = jobMap.get(e.jobId);
+        const status = job?.enabled ? "✓" : "✗";
+        const last = job?.lastStatus || "never";
+        sections.push(`    ${status}  ${e.schedule.padEnd(15)} ${e.jobName.padEnd(30)} last: ${last}`);
+      }
+      sections.push("");
+    }
+
+    sections.push(`${entries.length} job(s) across ${byProject.size} project(s)`);
+    ctx.ui.notify(sections.join("\n"), "info");
+  }
+}
+
 // ── Extension entry point ────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
   // ── /cron command ──────────────────────────────────────────────────
   pi.registerCommand("cron", {
     description:
-      "Manage scheduled cron jobs (list|add|remove|enable|disable|run|install|uninstall|logs)",
+      "Manage scheduled cron jobs (list|show|add|remove|enable|disable|run|install|uninstall|logs)"
     getArgumentCompletions(prefix: string) {
       const subs = [
         "list",
+        "show",
         "add",
         "remove",
         "enable",
@@ -515,6 +625,9 @@ export default function (pi: ExtensionAPI) {
         case "list":
         case "ls":
           return cmdList(ctx);
+        case "show":
+        case "status":
+          return cmdShow(rest, ctx);
         case "add":
           return cmdAdd(rest, ctx);
         case "remove":
@@ -535,7 +648,7 @@ export default function (pi: ExtensionAPI) {
           return cmdLogs(rest, ctx);
         default:
           ctx.ui.notify(
-            "Usage: /cron <list|add|remove|enable|disable|run|install|uninstall|logs>",
+            "Usage: /cron <list|show|add|remove|enable|disable|run|install|uninstall|logs>",
             "info"
           );
       }
@@ -547,7 +660,7 @@ export default function (pi: ExtensionAPI) {
     name: "cron_manage",
     label: "Cron Manager",
     description:
-      "Manage scheduled automated tasks for pi. Can list, create, remove, toggle, and manually trigger cron jobs that execute pi prompts against project directories on a time schedule.",
+      "Manage scheduled automated tasks for pi. Can list, show crontab status, create, remove, toggle, and manually trigger cron jobs that execute pi prompts against project directories on a time schedule.",
     promptSnippet: "Manage scheduled cron jobs for automated pi task execution",
     promptGuidelines: [
       "Use cron_manage to schedule pi prompts to run automatically via cron",
@@ -557,6 +670,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       action: StringEnum([
         "list",
+        "show",
         "add",
         "remove",
         "enable",
@@ -591,6 +705,9 @@ export default function (pi: ExtensionAPI) {
         StringEnum(
           ["off", "minimal", "low", "medium", "high", "xhigh"] as const
         )
+      ),
+      scope: Type.Optional(
+        StringEnum(["all", "project"] as const, { description: "For 'show' action: 'all' shows every crontab entry, 'project' shows only current project (default)" })
       ),
       webhook: Type.Optional(
         Type.String({ description: "Webhook URL for result delivery (Slack/Discord)" })
@@ -630,6 +747,92 @@ export default function (pi: ExtensionAPI) {
             content: [{ type: "text", text: lines.join("\n") }],
             details: { jobs: config.jobs },
           };
+        }
+
+        case "show": {
+          const crontab = readCrontab();
+          if (!crontab.trim()) {
+            return {
+              content: [{ type: "text", text: "No crontab entries found." }],
+              details: {},
+            };
+          }
+
+          const entries: { jobId: string; jobName: string; schedule: string; line: string }[] = [];
+          const crLines = crontab.split("\n");
+          let currentMarker = "";
+          for (const line of crLines) {
+            if (line.includes(CRON_MARKER_START)) {
+              currentMarker = line;
+              continue;
+            }
+            if (line.includes(CRON_MARKER_END)) {
+              currentMarker = "";
+              continue;
+            }
+            if (currentMarker) {
+              const m = currentMarker.match(/PI-CRON:(\S+)\s*—\s*(.+)/);
+              const jobId = m?.[1] || "?";
+              const jobName = m?.[2]?.trim() || "?";
+              const trimmed = line.trim();
+              if (trimmed && !trimmed.startsWith("#")) {
+                entries.push({ jobId, jobName, schedule: trimmed.split(/\s+/).slice(0, 5).join(" "), line: trimmed });
+              }
+            }
+          }
+
+          if (entries.length === 0) {
+            return {
+              content: [{ type: "text", text: "No pi-cron entries in crontab. Run /cron install to register jobs." }],
+              details: {},
+            };
+          }
+
+          const showConfig = loadConfig();
+          const jobMap = new Map(showConfig.jobs.map((j) => [j.id, j]));
+          const isAll = params.scope === "all";
+
+          if (!isAll) {
+            const projectEntries = entries.filter((e) => {
+              const job = jobMap.get(e.jobId);
+              return job && job.cwd === ctx.cwd;
+            });
+            if (projectEntries.length === 0) {
+              return {
+                content: [{ type: "text", text: `No pi-cron entries for this project (${ctx.cwd}). Use scope='all' to see all entries.` }],
+                details: { cwd: ctx.cwd, totalEntries: entries.length },
+              };
+            }
+            const rows = projectEntries.map((e) => {
+              const job = jobMap.get(e.jobId);
+              return `${e.schedule}  ${e.jobName}  [${job?.enabled ? "ON" : "OFF"}]  last: ${job?.lastStatus || "never"}`;
+            });
+            return {
+              content: [{ type: "text", text: `Pi-cron entries for ${ctx.cwd}:\n${rows.join("\n")}` }],
+              details: { cwd: ctx.cwd, entries: projectEntries },
+            };
+          } else {
+            const byProject = new Map<string, typeof entries>();
+            for (const e of entries) {
+              const job = jobMap.get(e.jobId);
+              const projectCwd = job?.cwd || "unknown";
+              if (!byProject.has(projectCwd)) byProject.set(projectCwd, []);
+              byProject.get(projectCwd)!.push(e);
+            }
+            const sections: string[] = [];
+            for (const [projectCwd, projectEntries] of byProject) {
+              const isCurrent = projectCwd === ctx.cwd;
+              sections.push(`${isCurrent ? "▸" : " " } ${projectCwd}${isCurrent ? " (current)" : ""}`);
+              for (const e of projectEntries) {
+                const job = jobMap.get(e.jobId);
+                sections.push(`  ${e.schedule}  ${e.jobName}  [${job?.enabled ? "ON" : "OFF"}]  last: ${job?.lastStatus || "never"}`);
+              }
+            }
+            return {
+              content: [{ type: "text", text: `All pi-cron crontab entries:\n${sections.join("\n")}\n\n${entries.length} job(s) across ${byProject.size} project(s)` }],
+              details: { entries, projectCount: byProject.size },
+            };
+          }
         }
 
         case "add": {

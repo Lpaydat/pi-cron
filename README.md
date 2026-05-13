@@ -14,6 +14,8 @@ Schedule pi prompts to run automatically on a cron schedule against any project 
 | Command | Description |
 |---------|-------------|
 | `/cron list` | Show all configured jobs |
+| `/cron show` | Show crontab entries for current project |
+| `/cron show all` | Show all pi-cron crontab entries, grouped by project |
 | `/cron add` | Interactive wizard to create a job |
 | `/cron remove <id>` | Delete a job |
 | `/cron enable <id>` | Enable a disabled job |
