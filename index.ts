@@ -21,7 +21,150 @@ import {
 } from "./config";
 import type { CronJob } from "./types";
 
-const EXT_DIR = join(homedir(), ".pi", "agent", "extensions", "pi-cron");
+// ── Natural language schedule parser ─────────────────────────────────
+
+/**
+ * Converts natural language schedule descriptions to cron expressions.
+ * Handles patterns like:
+ *   "every day at 2am", "nightly at 3am", "every hour", "every 15 minutes",
+ *   "weekdays at 9am", "monday at 10am", "daily at 3:30pm",
+ *   "every monday at 9am", "twice a day at 9am and 5pm",
+ *   "every weekday at 8:30am", "hourly", "daily", "weekly"
+ */
+function parseNaturalSchedule(input: string): { cron: string; description: string } | null {
+  const s = input.toLowerCase().trim().replace(/\s+/g, " ");
+
+  // ── Direct cron pass-through (5 numeric fields) ────────────────
+  if (/^[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+\s+[\d*/,\-]+$/.test(s)) {
+    return { cron: s, description: formatCronDescription(s) };
+  }
+
+  // ── Helper: parse time like "2am", "3:30pm", "14:00", "2:30 am" ─
+  const parseTime = (str: string): { hour: number; minute: number } | null => {
+    const m = str.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+    if (!m) return null;
+    let hour = parseInt(m[1], 10);
+    const minute = m[2] ? parseInt(m[2], 10) : 0;
+    const ampm = m[3]?.toLowerCase();
+    if (ampm === "pm" && hour !== 12) hour += 12;
+    if (ampm === "am" && hour === 12) hour = 0;
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return { hour, minute };
+  };
+
+  const dayNames: Record<string, number> = {
+    sunday: 0, sun: 0,
+    monday: 1, mon: 1,
+    tuesday: 2, tue: 2,
+    wednesday: 3, wed: 3,
+    thursday: 4, thu: 4,
+    friday: 5, fri: 5,
+    saturday: 6, sat: 6,
+  };
+
+  const dayAliases: Record<string, string> = {
+    weekday: "1-5", weekdays: "1-5",
+    "work day": "1-5", "work days": "1-5", workday: "1-5", workdays: "1-5",
+    "business day": "1-5", "business days": "1-5",
+    weekend: "0,6", weekends: "0,6",
+  };
+
+  // ── "every N minutes" ──────────────────────────────────────────
+  let m = s.match(/every\s+(\d+)\s+min(?:ute)?s?/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 59) return { cron: `*/${n} * * * *`, description: `every ${n} minutes` };
+  }
+
+  // ── "every N hours [at M]" ─────────────────────────────────────
+  m = s.match(/every\s+(\d+)\s+hours?(?:\s+at\s+(\d(?::\d{2})?(?:\s*[ap]m)?))?/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n >= 1 && n <= 23) {
+      if (m[2]) {
+        const t = parseTime(m[2]);
+        if (t) return { cron: `${t.minute} */${n} * * *`, description: `every ${n} hours at ${t.hour}:${String(t.minute).padStart(2, "0")}` };
+      }
+      return { cron: `0 */${n} * * *`, description: `every ${n} hours` };
+    }
+  }
+
+  // ── "every minute" ─────────────────────────────────────────────
+  if (/\bevery\s+minute\b/.test(s)) {
+    return { cron: "* * * * *", description: "every minute" };
+  }
+
+  // ── "hourly" / "every hour" ────────────────────────────────────
+  if (/\bhourly\b/.test(s) || /\bevery\s+hour\b/.test(s)) {
+    return { cron: "0 * * * *", description: "every hour" };
+  }
+
+  // ── Extract optional "at <time>" ──────────────────────────────
+  const timeMatch = s.match(/\bat\s+(\d{1,2}(?::\d{2})?(?:\s*[ap]m)?)/);
+  const time = timeMatch ? parseTime(timeMatch[1]) : null;
+
+  // ── Extract day-of-week patterns ───────────────────────────────
+  let dow: string | null = null;
+  for (const [alias, expr] of Object.entries(dayAliases)) {
+    if (s.includes(alias)) { dow = expr; break; }
+  }
+  if (!dow) {
+    for (const [name, num] of Object.entries(dayNames)) {
+      // Match "monday", "mondays", "on mon", "every mon"
+      const re = new RegExp(`\\b(?:every\\s+)?(?:on\\s+)?${name}s?\\b`);
+      if (re.test(s)) { dow = String(num); break; }
+    }
+  }
+
+  // ── "daily" / "every day" / "nightly" ──────────────────────────
+  if (/\b(daily|every\s+day|nightly|each\s+day)\b/.test(s)) {
+    if (time) return { cron: `${time.minute} ${time.hour} * * *`, description: `daily at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
+    if (/\bnightly\b/.test(s)) return { cron: "0 0 * * *", description: "nightly at midnight" };
+    return { cron: "0 0 * * *", description: "daily at midnight" };
+  }
+
+  // ── "weekly" / "every week" ────────────────────────────────────
+  if (/\b(weekly|every\s+week)\b/.test(s)) {
+    if (time) return { cron: `${time.minute} ${time.hour} * * 1`, description: `weekly on Monday at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
+    return { cron: "0 0 * * 1", description: "weekly on Monday at midnight" };
+  }
+
+  // ── "monthly" / "every month" ──────────────────────────────────
+  if (/\b(monthly|every\s+month)\b/.test(s)) {
+    if (time) return { cron: `${time.minute} ${time.hour} 1 * *`, description: `monthly on the 1st at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
+    return { cron: "0 0 1 * *", description: "monthly on the 1st at midnight" };
+  }
+
+  // ── Day-of-week without "daily" keyword ────────────────────────
+  if (dow && time) {
+    const dayLabel = Object.entries(dayNames).find(([, v]) => String(v) === dow)?.[0] ?? dow;
+    const aliasLabel = Object.entries(dayAliases).find(([, v]) => v === dow)?.[0] ?? null;
+    const label = aliasLabel || dayLabel;
+    return { cron: `${time.minute} ${time.hour} * * ${dow}`, description: `every ${label} at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
+  }
+  if (dow) {
+    const dayLabel = Object.entries(dayNames).find(([, v]) => String(v) === dow)?.[0] ?? dow;
+    const aliasLabel = Object.entries(dayAliases).find(([, v]) => v === dow)?.[0] ?? null;
+    const label = aliasLabel || dayLabel;
+    return { cron: `0 0 * * ${dow}`, description: `every ${label} at midnight` };
+  }
+
+  // ── Just a time: "at 2am", "3:30pm" ────────────────────────────
+  if (time && !dow) {
+    return { cron: `${time.minute} ${time.hour} * * *`, description: `daily at ${time.hour}:${String(time.minute).padStart(2, "0")}` };
+  }
+
+  return null;
+}
+
+// ── Auto-generate job name from prompt ───────────────────────────────
+
+function deriveNameFromPrompt(prompt: string): string {
+  // Take first sentence, trim to 60 chars
+  const first = prompt.replace(/\n/g, " ").split(/[.!?\n]/)[0].trim();
+  if (first.length <= 60) return first;
+  return first.substring(0, 57) + "...";
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -212,32 +355,8 @@ async function cmdList(ctx: any) {
 }
 
 async function cmdAdd(rest: string[], ctx: any) {
-  const name = await ctx.ui.input("Job name:", "My scheduled task");
-  if (!name) {
-    ctx.ui.notify("Cancelled.", "info");
-    return;
-  }
-
-  const scheduleInput = await ctx.ui.input(
-    "Schedule (cron expression):",
-    "0 2 * * *"
-  );
-  if (!scheduleInput) {
-    ctx.ui.notify("Cancelled.", "info");
-    return;
-  }
-
-  const validation = validateCron(scheduleInput);
-  if (!validation.valid) {
-    ctx.ui.notify(`Invalid cron: ${validation.error}`, "error");
-    return;
-  }
-
-  const desc = formatCronDescription(scheduleInput);
-  ctx.ui.notify(`Schedule interpreted as: ${desc}`, "info");
-
   const prompt = await ctx.ui.editor(
-    "Enter the prompt for pi to execute:",
+    "What should pi do?",
     ""
   );
   if (!prompt) {
@@ -245,29 +364,36 @@ async function cmdAdd(rest: string[], ctx: any) {
     return;
   }
 
-  const modelInput = await ctx.ui.input(
-    "Model (leave empty for default, or e.g. anthropic/claude-sonnet-4-20250514):",
-    ""
+  const scheduleInput = await ctx.ui.input(
+    "When? (e.g. 'every day at 2am', 'weekdays at 9am', 'hourly', or cron expression):",
+    "daily at midnight"
   );
+  if (!scheduleInput) {
+    ctx.ui.notify("Cancelled.", "info");
+    return;
+  }
 
-  const thinkingInput = await ctx.ui.input(
-    "Thinking level (off/minimal/low/medium/high/xhigh, leave empty for default):",
-    ""
-  );
+  // Try natural language first, fall back to cron validation
+  const parsed = parseNaturalSchedule(scheduleInput);
+  let schedule: string;
+  if (parsed) {
+    schedule = parsed.cron;
+    ctx.ui.notify(`Understood as: ${parsed.description} (${schedule})`, "info");
+  } else {
+    const validation = validateCron(scheduleInput);
+    if (!validation.valid) {
+      ctx.ui.notify(`Could not parse schedule: ${validation.error}`, "error");
+      return;
+    }
+    schedule = scheduleInput;
+  }
 
-  const webhook = await ctx.ui.input(
-    "Webhook URL for results (optional — Slack/Discord webhook):",
-    ""
-  );
-
-  const writeFile = await ctx.ui.input(
-    "Output file path (optional — supports {date} and {timestamp} placeholders):",
-    ""
-  );
+  const name = deriveNameFromPrompt(prompt);
+  const desc = formatCronDescription(schedule);
 
   const confirm = await ctx.ui.confirm(
-    "Create this job?",
-    `${name}\n  Schedule: ${scheduleInput} (${desc})\n  CWD: ${ctx.cwd}\n  Model: ${modelInput || "default"}\n  Webhook: ${webhook || "none"}\n  File: ${writeFile || "none"}`
+    "Create this scheduled job?",
+    `${name}\n  Schedule: ${schedule} (${desc})\n  CWD: ${ctx.cwd}\n\nPrompt:\n  ${prompt.substring(0, 300)}${prompt.length > 300 ? "..." : ""}`
   );
 
   if (!confirm) {
@@ -278,15 +404,9 @@ async function cmdAdd(rest: string[], ctx: any) {
   const job: CronJob = {
     id: generateId(),
     name,
-    schedule: scheduleInput,
+    schedule,
     cwd: ctx.cwd,
     prompt,
-    model: modelInput || undefined,
-    thinkingLevel: thinkingInput || undefined,
-    onComplete: {
-      webhook: webhook || undefined,
-      writeFile: writeFile || undefined,
-    },
     enabled: true,
     lastRun: null,
     lastResult: null,
@@ -296,7 +416,7 @@ async function cmdAdd(rest: string[], ctx: any) {
 
   addJob(job);
   ctx.ui.notify(
-    `✅ Job "${job.name}" created (ID: ${job.id})\nRun /cron install to register with crontab, or /cron run ${job.id} to test now.`,
+    `✅ Job "${job.name}" created (ID: ${job.id})\n  Schedule: ${schedule} (${desc})\nRun /cron install to register with crontab, or /cron run ${job.id} to test now.`,
     "success"
   );
 }
@@ -572,9 +692,7 @@ async function cmdShow(rest: string[], ctx: any) {
     }
 
     const sections: string[] = ["📋 All pi-cron crontab entries:\n"];
-    let projectIndex = 0;
     for (const [projectCwd, projectEntries] of byProject) {
-      projectIndex++;
       const isCurrentProject = projectCwd === cwd;
       sections.push(`  ${isCurrentProject ? "▸" : " "} Project: ${projectCwd}${isCurrentProject ? "  (current)" : ""}`);
 
@@ -660,12 +778,15 @@ export default function (pi: ExtensionAPI) {
     name: "cron_manage",
     label: "Cron Manager",
     description:
-      "Manage scheduled automated tasks for pi. Can list, show crontab status, create, remove, toggle, and manually trigger cron jobs that execute pi prompts against project directories on a time schedule.",
-    promptSnippet: "Manage scheduled cron jobs for automated pi task execution",
+      "Schedule and manage automated pi tasks. Accepts natural language for scheduling — the agent should derive the job name and schedule from the user's request automatically. Only requires the prompt (what to run) and when to run it.",
+    promptSnippet: "Schedule automated cron jobs for pi",
     promptGuidelines: [
-      "Use cron_manage to schedule pi prompts to run automatically via cron",
-      "Each job targets a specific project directory and uses that project's pi settings",
-      "Cron expressions use 5 fields: minute hour day-of-month month day-of-week (e.g. '0 2 * * *' = 2am daily)",
+      "ALWAYS auto-derive the job name and schedule from the user's request — never ask the user for a cron expression or job name",
+      "The 'when' parameter accepts natural language: 'every day at 2am', 'weekdays at 9am', 'hourly', 'every 15 minutes', 'nightly', 'mondays at 10am', etc.",
+      "The 'name' parameter is optional — if omitted, it's auto-generated from the prompt",
+      "The 'schedule' parameter is also optional — use 'when' for natural language instead",
+      "Each job targets a project directory and uses that project's pi settings (extensions, skills, AGENTS.md)",
+      "After creating a job, tell the user to run /cron install to register with crontab, or /cron run <id> to test",
     ],
     parameters: Type.Object({
       action: StringEnum([
@@ -681,15 +802,20 @@ export default function (pi: ExtensionAPI) {
         Type.String({ description: "Job ID (for remove/enable/disable/run)" })
       ),
       name: Type.Optional(
-        Type.String({ description: "Human-readable job name (for add)" })
+        Type.String({ description: "Job name. Auto-generated from prompt if omitted." })
       ),
       schedule: Type.Optional(
         Type.String({
-          description: "Cron expression, e.g. '0 2 * * *' for 2am daily",
+          description: "Cron expression (e.g. '0 2 * * *'). Prefer 'when' for natural language.",
+        })
+      ),
+      when: Type.Optional(
+        Type.String({
+          description: "Natural language schedule: 'every day at 2am', 'weekdays at 9am', 'hourly', 'every 15 minutes', 'nightly', 'mondays at 10am', 'daily at 3:30pm', etc.",
         })
       ),
       prompt: Type.Optional(
-        Type.String({ description: "The pi prompt to execute (for add)" })
+        Type.String({ description: "The pi prompt to execute (for add). Required for add action." })
       ),
       cwd: Type.Optional(
         Type.String({
@@ -836,31 +962,76 @@ export default function (pi: ExtensionAPI) {
         }
 
         case "add": {
-          if (!params.name || !params.schedule || !params.prompt) {
+          if (!params.prompt) {
             return {
               content: [
                 {
                   type: "text",
-                  text: "Missing required fields for 'add': name, schedule, and prompt are all required.",
+                  text: "The 'prompt' field is required — what should pi do?",
                 },
               ],
               details: {},
             };
           }
-          const validation = validateCron(params.schedule);
-          if (!validation.valid) {
+
+          // ── Resolve schedule: when (natural) → schedule (cron) ────
+          let schedule: string | null = null;
+          let scheduleDesc: string = "";
+
+          if (params.when) {
+            const parsed = parseNaturalSchedule(params.when);
+            if (parsed) {
+              schedule = parsed.cron;
+              scheduleDesc = parsed.description;
+            } else {
+              // Try as raw cron expression
+              const v = validateCron(params.when);
+              if (v.valid) {
+                schedule = params.when;
+                scheduleDesc = formatCronDescription(params.when);
+              } else {
+                return {
+                  content: [
+                    {
+                      type: "text",
+                      text: `Could not parse "${params.when}" as a schedule. Try something like "every day at 2am", "weekdays at 9am", "hourly", or a cron expression like "0 2 * * *".`,
+                    },
+                  ],
+                  details: {},
+                };
+              }
+            }
+          } else if (params.schedule) {
+            const v = validateCron(params.schedule);
+            if (!v.valid) {
+              return {
+                content: [{ type: "text", text: `Invalid cron expression: ${v.error}` }],
+                details: {},
+              };
+            }
+            schedule = params.schedule;
+            scheduleDesc = formatCronDescription(params.schedule);
+          }
+
+          if (!schedule) {
             return {
               content: [
-                { type: "text", text: `Invalid cron expression: ${validation.error}` },
+                {
+                  type: "text",
+                  text: "No schedule provided. Use 'when' (e.g. 'daily at 2am') or 'schedule' (cron expression).",
+                },
               ],
               details: {},
             };
           }
 
+          // ── Auto-derive name from prompt if not given ────────────
+          const name = params.name || deriveNameFromPrompt(params.prompt);
+
           const job: CronJob = {
             id: generateId(),
-            name: params.name,
-            schedule: params.schedule,
+            name,
+            schedule,
             cwd: params.cwd || ctx.cwd,
             prompt: params.prompt,
             model: params.model || undefined,
@@ -881,7 +1052,7 @@ export default function (pi: ExtensionAPI) {
             content: [
               {
                 type: "text",
-                text: `✅ Created job "${job.name}" (ID: ${job.id})\n  Schedule: ${job.schedule} (${formatCronDescription(job.schedule)})\n  CWD: ${job.cwd}\n  Model: ${job.model || "default"}\n  Webhook: ${job.onComplete?.webhook || "none"}\n  File: ${job.onComplete?.writeFile || "none"}\n\nTell the user to run /cron install to register with crontab, or /cron run ${job.id} to test.`,
+                text: `✅ Created scheduled job "${job.name}" (ID: ${job.id})\n  Schedule: ${job.schedule} (${scheduleDesc})\n  CWD: ${job.cwd}\n  Model: ${job.model || "default"}\n  Webhook: ${job.onComplete?.webhook || "none"}\n  File: ${job.onComplete?.writeFile || "none"}\n\nTell the user to run /cron install to register with crontab, or /cron run ${job.id} to test.`,
               },
             ],
             details: { job },
