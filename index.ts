@@ -166,6 +166,44 @@ function deriveNameFromPrompt(prompt: string): string {
   return first.substring(0, 57) + "...";
 }
 
+// ── Extract prompt + schedule from a single natural text ─────────────
+//
+// Given: "review code every day at 2am"
+//   → { prompt: "review code", when: "every day at 2am" }
+//
+// Given: "send a daily standup report at 9am"
+//   → { prompt: "send a daily standup report", when: "at 9am" }
+//
+// Given: "run the test suite"  (no schedule found)
+//   → { prompt: "run the test suite" }
+//
+function extractPromptAndSchedule(text: string): { prompt: string; when?: string } {
+  const schedulePatterns = [
+    // "every N minutes/hours [at time]"
+    /\s+every\s+\d+\s+(?:min(?:ute)?s?|hours?)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
+    // "every day/week/month/hour/minute/weekday/Monday etc [at time]"
+    /\s+every\s+(?:day|week|month|hour|minute|night|weekday|weekend|mon(?:day)?|tue(?:sday)?|wed(?:nesday)?|thu(?:rsday)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)\w*(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
+    // "daily/nightly/hourly/weekly/monthly [at time]"
+    /\s+(?:daily|nightly|hourly|weekly|monthly)(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
+    // "on weekdays/weekends/Monday [at time]"
+    /\s+on\s+(?:weekdays?|weekends?|mondays?|tuesdays?|wednesdays?|thursdays?|fridays?|saturdays?|sundays?)\w*(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?\s*$/i,
+    // "at 2am/3:30pm" (time-only → daily)
+    /\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)\s*$/i,
+  ];
+
+  for (const pattern of schedulePatterns) {
+    const match = text.match(pattern);
+    if (match) {
+      const when = match[0].trim();
+      const prompt = text.substring(0, text.length - match[0].length).trim();
+      // Only use if there's actual prompt content left
+      if (prompt) return { prompt, when };
+    }
+  }
+
+  return { prompt: text };
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 function ensureLogsDir(jobId: string): string {
@@ -355,51 +393,71 @@ async function cmdList(ctx: any) {
 }
 
 async function cmdAdd(rest: string[], ctx: any) {
-  const prompt = await ctx.ui.editor(
-    "What should pi do?",
-    ""
-  );
-  if (!prompt) {
-    ctx.ui.notify("Cancelled.", "info");
-    return;
+  // Accept full natural text as args, or prompt once if empty
+  let text = rest.join(" ").trim();
+
+  // Strip surrounding quotes
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    text = text.slice(1, -1);
   }
 
-  const scheduleInput = await ctx.ui.input(
-    "When? (e.g. 'every day at 2am', 'weekdays at 9am', 'hourly', or cron expression):",
-    "daily at midnight"
-  );
-  if (!scheduleInput) {
-    ctx.ui.notify("Cancelled.", "info");
-    return;
-  }
-
-  // Try natural language first, fall back to cron validation
-  const parsed = parseNaturalSchedule(scheduleInput);
-  let schedule: string;
-  if (parsed) {
-    schedule = parsed.cron;
-    ctx.ui.notify(`Understood as: ${parsed.description} (${schedule})`, "info");
-  } else {
-    const validation = validateCron(scheduleInput);
-    if (!validation.valid) {
-      ctx.ui.notify(`Could not parse schedule: ${validation.error}`, "error");
+  if (!text) {
+    text = await ctx.ui.input(
+      "What should pi do and when?",
+      "review code every day at 2am"
+    );
+    if (!text) {
+      ctx.ui.notify("Cancelled.", "info");
       return;
     }
-    schedule = scheduleInput;
+  }
+
+  // Try to extract schedule from the natural text
+  const extracted = extractPromptAndSchedule(text);
+  let prompt = extracted.prompt;
+  let schedule: string | null = null;
+  let scheduleDesc = "";
+
+  if (extracted.when) {
+    const parsed = parseNaturalSchedule(extracted.when);
+    if (parsed) {
+      schedule = parsed.cron;
+      scheduleDesc = parsed.description;
+    }
+  }
+
+  // If we still don't have a schedule, ask ONE follow-up
+  if (!schedule) {
+    const whenInput = await ctx.ui.input(
+      "When should this run?",
+      "every day at midnight"
+    );
+    if (!whenInput) {
+      ctx.ui.notify("Cancelled.", "info");
+      return;
+    }
+
+    const parsed = parseNaturalSchedule(whenInput);
+    if (parsed) {
+      schedule = parsed.cron;
+      scheduleDesc = parsed.description;
+    } else {
+      // Last resort: try as raw cron expression
+      const v = validateCron(whenInput);
+      if (v.valid) {
+        schedule = whenInput;
+        scheduleDesc = formatCronDescription(whenInput);
+      } else {
+        ctx.ui.notify(
+          `Could not understand that schedule. Try something like:\n  "every day at 2am"\n  "weekdays at 9am"\n  "every 15 minutes"\n  "hourly"\n  "0 2 * * *" (cron expression)`,
+          "error"
+        );
+        return;
+      }
+    }
   }
 
   const name = deriveNameFromPrompt(prompt);
-  const desc = formatCronDescription(schedule);
-
-  const confirm = await ctx.ui.confirm(
-    "Create this scheduled job?",
-    `${name}\n  Schedule: ${schedule} (${desc})\n  CWD: ${ctx.cwd}\n\nPrompt:\n  ${prompt.substring(0, 300)}${prompt.length > 300 ? "..." : ""}`
-  );
-
-  if (!confirm) {
-    ctx.ui.notify("Cancelled.", "info");
-    return;
-  }
 
   const job: CronJob = {
     id: generateId(),
@@ -416,7 +474,7 @@ async function cmdAdd(rest: string[], ctx: any) {
 
   addJob(job);
   ctx.ui.notify(
-    `✅ Job "${job.name}" created (ID: ${job.id})\n  Schedule: ${schedule} (${desc})\nRun /cron install to register with crontab, or /cron run ${job.id} to test now.`,
+    `✅ Created "${job.name}"\n  Schedule: ${scheduleDesc} (${schedule})\n  CWD: ${job.cwd}\n  Prompt: ${prompt.substring(0, 200)}${prompt.length > 200 ? "..." : ""}\n\nRun /cron install to register with crontab, or /cron run ${job.id} to test.`,
     "success"
   );
 }
