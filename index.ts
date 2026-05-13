@@ -864,13 +864,20 @@ export default function (pi: ExtensionAPI) {
           // For one-shot jobs, start the timer now
           if (jobType === "once" && delayMs) {
             ctx.ui.notify(`⏱️ One-shot job "${name}" will run ${scheduleDesc}...`, "info");
+            const capturedCwd = job.cwd;
+            const capturedJobId = job.id;
             const timer = setTimeout(() => {
-              activeTimers.delete(job.id);
-              if (!existsSync(job.cwd)) return;
-              runJobInBackground(job, ctx);
+              activeTimers.delete(capturedJobId);
+              // Re-read job from disk in case config changed
+              const freshJob = findJob(capturedJobId);
+              if (!freshJob || !existsSync(capturedCwd)) return;
+              try {
+                runJobInBackground(freshJob, ctx);
+              } catch (e: any) {
+                console.error(`[pi-cron] one-shot run failed: ${e.message}`);
+              }
               // Auto-disable after firing
-              updateJob(job.id, { enabled: false });
-              ctx.ui.notify(`✅ One-shot job "${name}" fired and executed`, "success");
+              updateJob(capturedJobId, { enabled: false });
             }, delayMs);
             activeTimers.set(job.id, timer);
           }
