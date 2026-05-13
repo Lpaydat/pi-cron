@@ -598,7 +598,7 @@ export default function (pi: ExtensionAPI) {
   // ── /cron command ──────────────────────────────────────────────────
   pi.registerCommand("cron", {
     description:
-      "Manage scheduled cron jobs (list|show|add|remove|enable|disable|run|install|uninstall|logs)"
+      "Manage scheduled cron jobs (list|show|add|remove|enable|disable|run|install|uninstall|logs)",
     getArgumentCompletions(prefix: string) {
       const subs = [
         "list",
